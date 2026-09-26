@@ -1,0 +1,20 @@
+{
+  "versionName": "1.4.0",
+  "versionCode": 7,
+  "tag": "v1.4.0",
+  "publishedAt": "2026-09-25T17:54:11Z",
+  "releasePage": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/tag/v1.4.0",
+  "download": {
+    "arm64": {
+      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent/releases/download/v1.4.0/ApexAgent-v1.4.0-release-arm64-a3803c00.apk",
+      "sizeBytes": 332888660,
+      "sha256": null
+    },
+    "universal": {
+      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent/releases/download/v1.4.0/ApexAgent-v1.4.0-release-universal-a3803c00.apk",
+      "sizeBytes": 947645240,
+      "sha256": null
+    }
+  },
+  "patch": null
+}
