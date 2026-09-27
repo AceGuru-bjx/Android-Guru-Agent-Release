@@ -1,33 +1,33 @@
 {
-  "versionName": "1.4.4.1",
-  "versionCode": 20,
-  "tag": "v1.4.4.1",
-  "publishedAt": "2026-09-27T03:28:51Z",
-  "releasePage": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/tag/v1.4.4.1",
+  "versionName": "1.4.4.2",
+  "versionCode": 21,
+  "tag": "v1.4.4.2",
+  "publishedAt": "2026-09-27T03:39:57Z",
+  "releasePage": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/tag/v1.4.4.2",
   "download": {
     "arm64": {
-      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/download/v1.4.4.1/ApexAgent-v1.4.4.1-release-arm64-d94df5bc.apk",
-      "sizeBytes": 333914113,
-      "sha256": "52381559c8fb3230a2e4f56d86e7f6835297c48c509c3e82dcd32509d891aad7"
+      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/download/v1.4.4.2/ApexAgent-v1.4.4.2-release-arm64-113a1786.apk",
+      "sizeBytes": 334000933,
+      "sha256": "ccccbf1deed4833437288e88a5ca1cdd6782e2d29a6ceb4fe5d0c036ff9f781c"
     },
     "universal": {
-      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/download/v1.4.4.1/ApexAgent-v1.4.4.1-release-universal-d94df5bc.apk",
-      "sizeBytes": 948798209,
-      "sha256": "b8423c51906238be6a71782d7a921acffb8c89da9b9f1288245724f7f2fdb52d"
+      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/download/v1.4.4.2/ApexAgent-v1.4.4.2-release-universal-113a1786.apk",
+      "sizeBytes": 948887341,
+      "sha256": "aa02702a6cb91a1a039420fe2cdc3079ce683131d20f20d1c98e6c6c5355b3d9"
     }
   },
   "patch": {
     "arm64": {
-      "fromTag": "v1.4.4",
-      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/download/v1.4.4.1/patch_arm64_v1.4.4_to_v1.4.4.1.vcdiff",
-      "sizeBytes": 11676211,
-      "sha256": "89b8371d00820044116b06fd0f471b593d07d9e6dd0174a85086fe917ab4975a"
+      "fromTag": "v1.4.4.1",
+      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/download/v1.4.4.2/patch_arm64_v1.4.4.1_to_v1.4.4.2.vcdiff",
+      "sizeBytes": 18340686,
+      "sha256": "1dbc41cf932319452f8b49a3b37a88ff898c2c56d84ea8e5f89cec58ce9d310e"
     },
     "universal": {
-      "fromTag": "v1.4.4",
-      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/download/v1.4.4.1/patch_universal_v1.4.4_to_v1.4.4.1.vcdiff",
-      "sizeBytes": 11679096,
-      "sha256": "1c8c0d1687cc2780b89e33f0097c01ac107e9b15f9619d9e3599a0d1f649a1d0"
+      "fromTag": "v1.4.4.1",
+      "url": "https://github.com/AceGuru-mjh/Android-Guru-Agent-Release/releases/download/v1.4.4.2/patch_universal_v1.4.4.1_to_v1.4.4.2.vcdiff",
+      "sizeBytes": 18393165,
+      "sha256": "8c3017deaf2aed89d2ce2186dcf152fc7e02209e66047d29ccb8c049de61059e"
     }
   }
 }
