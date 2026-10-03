@@ -1,0 +1,252 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# validate-manifests.yml — 版本清单 / 补丁索引结构校验门禁
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 本仓库（Android-Guru-Agent-Release）是补丁发布主体：main 分支上的
+# version.json 是全体客户端「检查更新」的固定读取点，patches.json 是
+# 跨版本链式增量的数据底座 —— 这两个文件的形状错误会**同时打挂所有
+# 客户端**的更新检查，且没有任何编译期保护（纯数据仓库，无构建）。
+#
+# 因此任何对这两个文件的写入都要过结构门禁：
+#   • 开发仓库 release.yml CI 自动提交 → push 触发本门禁兜底；
+#   • hotfix 工作流应急重发 → 同样过 push 门禁；
+#   • 人工手改（紧急止血 / 修正）→ PR 流程强制校验后再合并。
+#
+# 校验为纯结构判定（零网络、零 Token、确定性输出）：
+#   version.json —— 必填字段 / 类型 / URL 与指纹格式 / 跨字段自洽
+#                   （tag↔versionName、hot.target↔versionCode）
+#   patches.json —— 条目结构 / URL 指向本仓库 Release 资产 / 无重复键
+#   跨文件 —— patches.latestTag == version.json.tag
+#   单调性 —— push 到 main 时 versionCode 相对上一提交不得回退
+#             （release.yml 的 versionCode 守卫只增不减，回退 = 事故）
+#
+# 热更通道（apex-hot-v1）字段见 HOT_UPDATE.md；缺省字段（hot /
+# commitSha / signingCertSha256）在 v1.4.7 之前的清单中合法，出现时
+# 按强 schema 校验。
+# ═══════════════════════════════════════════════════════════════════════════
+name: Validate manifests
+
+on:
+  push:
+    branches: [main]
+    paths: [version.json, patches.json]
+  pull_request:
+    paths: [version.json, patches.json]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-manifests-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Schema / integrity / monotonicity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 单调性检查需要上一提交的 version.json（push 到 main 时）
+          fetch-depth: 2
+
+      - name: "Validate version.json + patches.json"
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json
+          import re
+          import subprocess
+          import sys
+
+          REPO = "AceGuru-mjh/Android-Guru-Agent-Release"
+          RELEASE_BASE = f"https://github.com/{REPO}/releases"
+          ASSET_BASE = f"{RELEASE_BASE}/download"
+          HEX64 = re.compile(r"^[0-9a-f]{64}$")
+          SHA1_40 = re.compile(r"^[0-9a-f]{40}$")
+          ISO8601 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+          errors = []
+          warns = []
+
+          def err(msg):
+              errors.append(msg)
+
+          def warn(msg):
+              warns.append(msg)
+
+          def check_asset(node, path, tag=None):
+              """APK / 补丁 / 热更包资产档的公共形状。"""
+              if not isinstance(node, dict):
+                  err(f"{path}: 必须是对象")
+                  return
+              url = node.get("url")
+              if not isinstance(url, str) or not url.startswith(f"{ASSET_BASE}/"):
+                  err(f"{path}.url: 必须指向本仓库 Release 资产（{ASSET_BASE}/…），得到 {url!r}")
+              elif tag and not url.startswith(f"{ASSET_BASE}/{tag}/"):
+                  err(f"{path}.url: 资产必须挂在 {tag} 名下，得到 {url!r}")
+              sha = node.get("sha256")
+              if not isinstance(sha, str) or not HEX64.match(sha):
+                  err(f"{path}.sha256: 必须是 64 位小写 hex，得到 {sha!r}")
+              size = node.get("sizeBytes")
+              if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                  err(f"{path}.sizeBytes: 必须是正整数，得到 {size!r}")
+
+          # ── version.json ────────────────────────────────────────────────
+          try:
+              manifest = json.load(open("version.json", encoding="utf-8"))
+          except Exception as e:
+              print(f"::error::version.json 无法解析：{e}")
+              sys.exit(1)
+
+          vname = manifest.get("versionName")
+          if not isinstance(vname, str) or not re.match(r"^\d+\.\d+\.\d+(\.\d+)?$", vname):
+              err(f"versionName: 形如 1.4.7 / 1.4.7.1，得到 {vname!r}")
+
+          vcode = manifest.get("versionCode")
+          if not isinstance(vcode, int) or isinstance(vcode, bool) or vcode <= 0:
+              err(f"versionCode: 必须是正整数，得到 {vcode!r}")
+
+          tag = manifest.get("tag")
+          if tag != f"v{vname}":
+              err(f"tag: 必须是 v{{versionName}}（v{vname}），得到 {tag!r}")
+
+          published = manifest.get("publishedAt")
+          if not isinstance(published, str) or not ISO8601.match(published):
+              err(f"publishedAt: 必须 ISO-8601 UTC（…T…Z），得到 {published!r}")
+
+          page = manifest.get("releasePage")
+          if page != f"{RELEASE_BASE}/tag/{tag}":
+              err(f"releasePage: 必须指向 {tag} 的发布页，得到 {page!r}")
+
+          download = manifest.get("download")
+          if not isinstance(download, dict):
+              err("download: 必须存在且为对象（arm64 / universal）")
+          else:
+              for variant in ("arm64", "universal"):
+                  node = download.get(variant)
+                  if node is None:
+                      err(f"download.{variant}: 缺失")
+                  else:
+                      check_asset(node, f"download.{variant}", tag=tag)
+
+          patch = manifest.get("patch")
+          if patch is not None:
+              if not isinstance(patch, dict):
+                  err("patch: 存在时必须是对象")
+              else:
+                  for variant in ("arm64", "universal"):
+                      node = patch.get(variant)
+                      if node is None:
+                          continue
+                      check_asset(node, f"patch.{variant}", tag=tag)
+                      if node.get("fromTag") == tag:
+                          err(f"patch.{variant}.fromTag: 不得等于本版 tag（自差分）")
+
+          # ── 热更通道字段（v1.4.7+；缺省合法，出现即强校验）─────────────
+          hot = manifest.get("hot")
+          if hot is not None:
+              if not isinstance(hot, dict):
+                  err("hot: 存在时必须是对象（apex-hot-v1 资产档）")
+              else:
+                  check_asset(hot, "hot", tag=tag)
+                  base = hot.get("baseVersionCode")
+                  target = hot.get("targetVersionCode")
+                  for name, val in (("hot.baseVersionCode", base),
+                                    ("hot.targetVersionCode", target)):
+                      if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+                          err(f"{name}: 必须是正整数，得到 {val!r}")
+                  # 客户端门 1（HotUpdatePolicy）：hot 档目标必须与本清单
+                  # versionCode 一致 —— 不一致的清单对所有客户端直接失效
+                  if isinstance(target, int) and target != vcode:
+                      err(f"hot.targetVersionCode: 必须等于 versionCode（{vcode}），得到 {target}")
+                  # 基底不得高于目标（能力地板语义下 base == target 合法）
+                  if (isinstance(base, int) and isinstance(target, int)
+                          and base > target):
+                      err(f"hot.baseVersionCode（{base}）不得高于 target（{target}）")
+                  if not isinstance(hot.get("targetVersionName"), str):
+                      err("hot.targetVersionName: 必须是字符串（展示用）")
+
+          commit_sha = manifest.get("commitSha")
+          if commit_sha is not None:
+              if not isinstance(commit_sha, str) or not SHA1_40.match(commit_sha):
+                  err(f"commitSha: 存在时必须是 40 位 hex（开发仓库完整 SHA），得到 {commit_sha!r}")
+          elif tag and not tag.startswith(("v1.4.6", "v1.4.5")):
+              warn("commitSha 缺失 —— v1.4.7 起应由 release.yml 注入（热更通道自举基准）")
+
+          cert = manifest.get("signingCertSha256")
+          if cert is not None:
+              if not isinstance(cert, str) or not HEX64.match(cert):
+                  err(f"signingCertSha256: 存在时必须是 64 位 hex（签名预检指纹），得到 {cert!r}")
+          else:
+              warn("signingCertSha256 缺失 —— v1.4.7 起客户端签名预检将退化为旧行为")
+
+          # ── patches.json ────────────────────────────────────────────────
+          try:
+              index = json.load(open("patches.json", encoding="utf-8"))
+          except Exception as e:
+              print(f"::error::patches.json 无法解析：{e}")
+              sys.exit(1)
+
+          latest = index.get("latestTag")
+          if latest != tag:
+              err(f"patches.latestTag（{latest!r}）必须与 version.json.tag（{tag!r}）一致")
+
+          patches = index.get("patches")
+          if not isinstance(patches, list):
+              err("patches: 必须是数组")
+              patches = []
+          seen = set()
+          for i, entry in enumerate(patches):
+              p = f"patches[{i}]"
+              if not isinstance(entry, dict):
+                  err(f"{p}: 必须是对象")
+                  continue
+              variant = entry.get("variant")
+              if variant not in ("arm64", "universal"):
+                  err(f"{p}.variant: 只能是 arm64 / universal，得到 {variant!r}")
+              from_tag, to_tag = entry.get("fromTag"), entry.get("toTag")
+              if from_tag == to_tag:
+                  err(f"{p}: fromTag 不得等于 toTag（{from_tag!r}）")
+              key = (variant, from_tag, to_tag)
+              if key in seen:
+                  err(f"{p}: 重复条目 {key}")
+              seen.add(key)
+              url = entry.get("url")
+              if not isinstance(url, str) or not url.startswith(f"{ASSET_BASE}/{to_tag}/"):
+                  err(f"{p}.url: 必须指向 {to_tag} 名下的 Release 资产，得到 {url!r}")
+              sha = entry.get("sha256")
+              if not isinstance(sha, str) or not HEX64.match(sha):
+                  err(f"{p}.sha256: 必须是 64 位小写 hex，得到 {sha!r}")
+              size = entry.get("sizeBytes")
+              if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                  err(f"{p}.sizeBytes: 必须是正整数，得到 {size!r}")
+
+          # ── 单调性（仅 push 到 main：versionCode 只增不减）──────────────
+          if "${{ github.event_name }}" == "push" and "${{ github.ref }}" == "refs/heads/main":
+              prev = subprocess.run(
+                  ["git", "show", "HEAD~1:version.json"],
+                  capture_output=True, text=True)
+              if prev.returncode == 0:
+                  try:
+                      prev_vcode = json.loads(prev.stdout).get("versionCode")
+                      if isinstance(prev_vcode, int) and isinstance(vcode, int) and vcode < prev_vcode:
+                          err(f"versionCode 回退：{prev_vcode} → {vcode}"
+                              "（release.yml 守卫只增不减；回退会让已升级客户端收到降级误报）")
+                  except json.JSONDecodeError:
+                      warn("HEAD~1:version.json 不是合法 JSON —— 跳过单调性比对")
+              else:
+                  warn("无上一提交的 version.json —— 跳过单调性比对")
+
+          for w in warns:
+              print(f"::warning::{w}")
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              print(f"::error::清单校验失败：{len(errors)} 处结构问题 —— 客户端更新检查依赖这两个文件，请修复后再合并")
+              sys.exit(1)
+          n_hot = "含" if isinstance(hot, dict) else "不含"
+          print(f"✅ 清单校验通过：v{vname}（versionCode {vcode}）· "
+                f"补丁索引 {len(patches)} 条 · 热更档{n_hot} · tag {tag}")
+          PYEOF

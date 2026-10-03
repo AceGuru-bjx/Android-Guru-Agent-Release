@@ -1,0 +1,312 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# hotfix.yml — 应急热修发布（数据层同版本重发，零 APK 发版）
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 场景：某个已发布版本的数据层（技能 / MCP 目录）出了坏内容 —— 某技能
+# 清单写坏、目录条目指错 —— 需要**立刻**修复，但走开发仓库发版要完整
+# 构建（约 40 分钟，300MB APK + 多基底补丁），且对签名冲突用户毫无意义
+# （他们装不上任何 APK）。
+#
+# 本工作流让发布仓库（补丁发布主体）独立完成应急修复：
+#
+#   1. 从开发仓库指定 ref 取数据层快照（skills + mcp_catalog）；
+#   2. 白名单守卫：该 ref 相对本版 commitSha（version.json.commitSha）的
+#      变更必须全部落在热载路径（与开发仓库 release.yml 的 data-only
+#      判定同一把尺）—— 含代码变更的修复**不允许**走此通道（Android
+#      无 root 不能热换自身代码，硬上 = 数据/代码版本错配）；
+#   3. 按 apex-hot-v1 打包（hotmanifest.json 逐文件 SHA-256 + 数据快照），
+#      挂到**当前版本的既有 Release** 名下（hot_v<版本>.r<N>.zip）；
+#   4. 重写 version.json 的 hot 档（targetVersionCode 不变 + 新指纹）并
+#      提交 main —— 客户端检查更新时凭包指纹判定重新应用
+#      （HotUpdatePolicy 门 2，见开发仓库 docs/hot-update-pipeline.md）。
+#
+# 版本语义（重要）：
+#   • versionCode / versionName / tag / APK 下载档 / commitSha 一概不动 ——
+#     这是**数据层修订**，不是新版本；
+#   • 热更包为累积快照：任何 v1.4.7+（首个热通道客户端）都可安全应用，
+#     baseVersionCode 恒取热通道能力地板；
+#   • 已应用旧修订的客户端：同 target + 新指纹 → 自动重新应用（About 页
+#     出现热更卡片，一键生效，无需重启 App）。
+#
+# 操作手册（含前置条件与回滚）见本仓库 HOT_UPDATE.md「应急热修」一节。
+# ═══════════════════════════════════════════════════════════════════════════
+name: Emergency hot update
+
+on:
+  workflow_dispatch:
+    inputs:
+      dev_ref:
+        description: "开发仓库 ref（携带修复后数据文件的分支 / tag / SHA）"
+        required: true
+        default: "main"
+      note:
+        description: "修复说明（写入提交信息与 Run Summary，供溯源）"
+        required: true
+
+permissions:
+  contents: write
+
+# 应急重发串行化：两个 run 并发写 version.json 会互相覆盖 hot 档
+concurrency:
+  group: emergency-hot-update
+  cancel-in-progress: false
+
+env:
+  DEV_REPO: AceGuru-mjh/Android-Guru-Agent
+
+jobs:
+  republish:
+    name: "Republish data-layer hot package"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout this release repository"
+        uses: actions/checkout@v4
+
+      - name: "Read current manifest and guard preconditions"
+        id: read
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json
+
+          m = json.load(open("version.json", encoding="utf-8"))
+          with open("meta.env", "w", encoding="utf-8") as f:
+              f.write(f"VCODE={m['versionCode']}\n")
+              f.write(f"VNAME={m['versionName']}\n")
+              f.write(f"TAG={m['tag']}\n")
+              f.write(f"COMMIT_SHA={m.get('commitSha', '')}\n")
+          hot = m.get("hot")
+          if hot:
+              print(f"ℹ️  当前热更档：{hot.get('targetVersionName')} "
+                    f"({hot.get('sha256', '')[:12]}…)")
+          if not m.get("commitSha"):
+              print("::error::version.json 无 commitSha —— 应急热修通道要求本版清单"
+                    "由开发仓库 release.yml（v1.4.7+）发布（白名单比对需要本版"
+                    "commit 基准）。该版本请走开发仓库发版修复。")
+              raise SystemExit(1)
+          PYEOF
+          # 输出转 step outputs 供后续步骤
+          {
+            echo "vcode=$(grep ^VCODE= meta.env | cut -d= -f2)"
+            echo "vname=$(grep ^VNAME= meta.env | cut -d= -f2)"
+            echo "tag=$(grep ^TAG= meta.env | cut -d= -f2)"
+            echo "commit_sha=$(grep ^COMMIT_SHA= meta.env | cut -d= -f2)"
+          } >> "$GITHUB_OUTPUT"
+          echo "🏷️  目标版本：$(grep ^TAG= meta.env | cut -d= -f2)"
+
+      - name: "Guard dev ref (data-only whitelist, same rule as release.yml)"
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.read.outputs.commit_sha }}
+          DEV_REF: ${{ inputs.dev_ref }}
+        run: |
+          set -euo pipefail
+          # 与开发仓库 release.yml 的 data-only 判定同一把尺：
+          # compare(本版 commit → dev_ref) 的变更集必须全部落在
+          # app/src/main/assets/{skills,mcp_catalog}/<file>.json 白名单内。
+          STATUS=$(gh api "repos/${DEV_REPO}/compare/${BASE_SHA}...${DEV_REF}" \
+            --jq '{status: .status, truncated: .truncated,
+                   files: (.files // [] | map(.filename))}' 2>/dev/null || echo "")
+          if [ -z "$STATUS" ]; then
+            echo "::error::compare ${BASE_SHA}...${DEV_REF} 失败 —— ref 必须是本版 commit 的后代（修复合入 main 后再跑）。"
+            exit 1
+          fi
+          RELATION=$(echo "$STATUS" | jq -r '.status')
+          TRUNCATED=$(echo "$STATUS" | jq -r '.truncated')
+          FILES=$(echo "$STATUS" | jq -r '.files | join("\n")')
+          echo "compare 状态：${RELATION}（$(echo "$FILES" | grep -c . || true) 个文件变更）"
+          if [ "$RELATION" = "behind" ] || [ "$RELATION" = "diverged" ]; then
+            echo "::error::dev_ref 与本版 commit 关系为 ${RELATION} —— 必须是其后代（ahead/identical）：把修复合到本版 commit 之上再重试。"
+            exit 1
+          fi
+          if [ "$TRUNCATED" = "true" ]; then
+            echo "::error::compare 截断（>300 文件）—— 保守拒绝：变更集大到不可能只是数据修复，请走开发仓库发版。"
+            exit 1
+          fi
+          if [ -n "$(echo "$FILES" | grep -vE '^app/src/main/assets/(skills|mcp_catalog)/[^/]+\.json$' || true)" ]; then
+            echo "::error::dev_ref 含热载路径之外的变更 —— 含代码的修复不允许走应急通道（Android 无法热换代码）："
+            echo "$FILES" | grep -vE '^app/src/main/assets/(skills|mcp_catalog)/[^/]+\.json$' | head -20 | sed 's/^/    - /'
+            exit 1
+          fi
+          HEAD_SHA=$(gh api "repos/${DEV_REPO}/commits/${DEV_REF}" --jq .sha)
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "✅ 白名单守卫通过（dev@${HEAD_SHA:0:8}，$(echo "$FILES" | grep -c . || true) 个数据文件变更）"
+
+      - name: "Checkout dev repository (sparse: hot-load assets only)"
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEV_REPO }}
+          ref: ${{ steps.guard.outputs.head_sha }}
+          path: dev
+          sparse-checkout: |
+            app/src/main/assets/skills
+            app/src/main/assets/mcp_catalog
+
+      - name: "Package hot update zip (apex-hot-v1, same layout as release.yml)"
+        id: package
+        env:
+          VCODE: ${{ steps.read.outputs.vcode }}
+          VNAME: ${{ steps.read.outputs.vname }}
+          TAG: ${{ steps.read.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist meta
+          python3 - <<'PYEOF'
+          import hashlib, json, os, subprocess, zipfile
+
+          vcode, vname, tag = (int(os.environ["VCODE"]),
+                               os.environ["VNAME"], os.environ["TAG"])
+          REPO = "AceGuru-mjh/Android-Guru-Agent-Release"
+
+          # 热通道能力地板：首个携带热更客户端的 versionCode（v1.4.7）。
+          # 与开发仓库 release.yml 保持一致 —— 热更包是累积快照，对任何
+          # 热通道客户端皆可安全应用（详见 HOT_UPDATE.md 基底语义一节）。
+          HOT_FLOOR_VCODE = 49
+
+          def sha256_bytes(data):
+              return hashlib.sha256(data).hexdigest()
+
+          entries = []
+          hot_root = "dist-hot"
+          for section in ("skills", "mcp_catalog"):
+              src = os.path.join("dev/app/src/main/assets", section)
+              if not os.path.isdir(src):
+                  continue
+              for name in sorted(os.listdir(src)):
+                  if not name.endswith(".json"):
+                      continue
+                  data = open(os.path.join(src, name), "rb").read()
+                  rel = f"{section}/{name}"
+                  os.makedirs(os.path.join(hot_root, section), exist_ok=True)
+                  open(os.path.join(hot_root, rel), "wb").write(data)
+                  entries.append({"path": rel, "sha256": sha256_bytes(data)})
+
+          if not entries:
+              print("::error::数据层快照为空 —— dev 仓库该路径下没有任何 .json，检查 sparse-checkout 与 dev_ref")
+              raise SystemExit(1)
+
+          # 修订号：当前 Release 名下既有热更资产计数（原始包 hot_v*.zip 计 1，
+          # 重发包 hot_v*.rN.zip 计 N）→ 本次 = max + 1；无任何热更资产时为 1
+          names = subprocess.run(
+              ["gh", "api", f"repos/{REPO}/releases/tags/{tag}", "--jq",
+               ".assets[].name"], capture_output=True, text=True).stdout.split()
+          import re as _re
+          best = 0
+          prefix = f"hot_v{vname}"
+          for n in names:
+              m = _re.fullmatch(prefix + r"(?:\.r(\d+))?\.zip", n)
+              if m:
+                  best = max(best, int(m.group(1) or 1))
+          rev = best + 1
+          rev_name = f"{vname}-r{rev}"
+
+          manifest = {
+              "schema": "apex-hot-v1",
+              "targetVersionCode": vcode,
+              "targetVersionName": rev_name,
+              "entries": entries,
+          }
+          with open(os.path.join(hot_root, "hotmanifest.json"), "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+
+          zip_path = f"dist/hot_v{vname}.r{rev}.zip"
+          with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for root, _, files in os.walk(hot_root):
+                  for name in sorted(files):
+                      full = os.path.join(root, name)
+                      zf.write(full, os.path.relpath(full, hot_root))
+
+          meta = {
+              "file": f"hot_v{vname}.r{rev}.zip",
+              "baseVersionCode": HOT_FLOOR_VCODE,
+              "targetVersionCode": vcode,
+              "targetVersionName": rev_name,
+              "url": f"https://github.com/{REPO}/releases/download/{tag}/hot_v{vname}.r{rev}.zip",
+              "sizeBytes": os.path.getsize(zip_path),
+              "sha256": sha256_bytes(open(zip_path, "rb").read()),
+              "rev": rev,
+          }
+          with open("meta/hotfix.json", "w", encoding="utf-8") as f:
+              json.dump(meta, f, ensure_ascii=False)
+              f.write("\n")
+          print(f"📦 应急热更包：{meta['file']}（{len(entries)} 文件，"
+                f"{meta['sizeBytes'] // 1024} KB，rev {rev}）")
+          PYEOF
+
+      - name: "No-op guard and upload to current release"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.read.outputs.tag }}
+        run: |
+          set -euo pipefail
+          FILE=$(python3 -c "import json; print(json.load(open('meta/hotfix.json'))['file'])")
+          NEW_SHA=$(python3 -c "import json; print(json.load(open('meta/hotfix.json'))['sha256'])")
+          OLD_SHA=$(python3 -c "import json; print((json.load(open('version.json')).get('hot') or {}).get('sha256', ''))")
+          if [ "$NEW_SHA" = "$OLD_SHA" ]; then
+            echo "::notice::新包与当前热更档指纹一致 —— 数据无变化，无需重发（no-op 退出，未动任何文件）"
+            exit 0
+          fi
+          echo "UPLOAD=1" >> "$GITHUB_ENV"
+          gh release upload "$TAG" "dist/$FILE" --clobber
+          echo "✅ 资产已挂载：$TAG/$FILE"
+
+      - name: "Rewrite hot section in version.json and commit to main"
+        if: env.UPLOAD == '1'
+        env:
+          NOTE: ${{ inputs.note }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json
+
+          meta = json.load(open("meta/hotfix.json", encoding="utf-8"))
+          manifest = json.load(open("version.json", encoding="utf-8"))
+
+          # 只动 hot 档 —— versionCode / APK 下载档 / commitSha / 签名指纹
+          # 一概保持（数据层修订不是新版本；见工作流头注释「版本语义」）
+          manifest["hot"] = {
+              "baseVersionCode": meta["baseVersionCode"],
+              "targetVersionCode": meta["targetVersionCode"],
+              "targetVersionName": meta["targetVersionName"],
+              "url": meta["url"],
+              "sizeBytes": meta["sizeBytes"],
+              "sha256": meta["sha256"],
+          }
+          with open("version.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+          PYEOF
+          REV=$(python3 -c "import json; print(json.load(open('meta/hotfix.json'))['rev'])")
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          git commit -m "chore(hotfix): 数据层应急修订 r${REV} — ${NOTE}"
+          git push origin main
+          echo "✅ version.json hot 档已更新并推送 main"
+
+      - name: "Summary"
+        if: always()
+        run: |
+          if [ "${UPLOAD:-0}" = "1" ] && [ -f meta/hotfix.json ]; then
+            FILE=$(python3 -c "import json; print(json.load(open('meta/hotfix.json'))['file'])")
+            REV=$(python3 -c "import json; print(json.load(open('meta/hotfix.json'))['rev'])")
+            KB=$(python3 -c "import json; print(json.load(open('meta/hotfix.json'))['sizeBytes'] // 1024)")
+            URL=$(python3 -c "import json; print(json.load(open('meta/hotfix.json'))['url'])")
+            {
+              echo "### 🔥 应急热修已发布"
+              echo ""
+              echo "- 包：\`$FILE\`（$KB KB）· 修订 r$REV"
+              echo "- 下载：$URL"
+              echo ""
+              echo "客户端传播：v1.4.7+ 检查更新时凭**包指纹**判定重新应用（同 target 新指纹），"
+              echo "关于页出现热更卡片，一键生效零安装 —— 已应用旧修订的设备同样自动收到。"
+              echo "清单校验门禁（validate-manifests）将随后对本次 version.json 提交自动复核。"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ⏭️ 应急热修未执行（前置守卫拦截或 no-op）" >> "$GITHUB_STEP_SUMMARY"
+          fi
